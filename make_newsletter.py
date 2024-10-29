@@ -145,6 +145,8 @@ def collect_papers(queries, start_year=None, end_year=None, api_key=None):
             all_recent_papers.extend(papers)
             # Show immediate results for this term
             st.write(f"📍 Found {len(papers)} papers for '{query}'")
+
+        time.sleep(.5)  # avoid rate limiting
     
     return all_recent_papers, results_by_term
 

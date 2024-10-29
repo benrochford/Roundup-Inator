@@ -1,0 +1,7 @@
+streamlit
+requests
+pandas
+langchain-openai
+langchain
+python-docx
+markdown
