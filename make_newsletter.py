@@ -7,9 +7,7 @@ import docx
 import io
 import markdown
 import time
-import random
 
-# Add this near the top of the file with other constants
 DEFAULT_ROUNDUP_PROMPT = """Create a research round-up following this structure:
 
 # ((apparent topic)) Research Round-up: ((apparent date range from papers))
@@ -35,9 +33,8 @@ in paragraph form:
 - 5 or so important emerging trends based on developments from the research                                                     
 - 3 sentence discussion of potential implications, future research directions that are coming"""
 
-# Add near the top with other constants
 LOADING_MESSAGES = [
-    "Reading papers",
+    "Reading abstracts",
     "Highlighting important bits",
     "Taking a snack break",
     "Checking Mastodon for hot takes",
@@ -153,10 +150,8 @@ def collect_papers(queries, start_year=None, end_year=None, api_key=None):
 
 # Clean and process papers
 def process_papers(papers):
-    # Create DataFrame with basic error handling
     df = pd.DataFrame(papers)
     
-    # Define expected columns with default values
     expected_columns = {
         'title': None,
         'url': None,
