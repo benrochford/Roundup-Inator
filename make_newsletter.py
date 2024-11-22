@@ -7,6 +7,8 @@ import docx
 import io
 import markdown
 import time
+from langchain_community.llms import Ollama
+from datetime import datetime, timedelta
 
 DEFAULT_ROUNDUP_PROMPT = """Create a research round-up following this structure:
 
@@ -98,30 +100,65 @@ if 'newsletter_content' not in st.session_state:
     st.session_state.newsletter_content = None
 if 'custom_prompt' not in st.session_state:
     st.session_state.custom_prompt = DEFAULT_ROUNDUP_PROMPT
+if 'openai_api_key' not in st.session_state:
+    st.session_state.openai_api_key = None
+if 'top_n_papers' not in st.session_state:
+    st.session_state.top_n_papers = 35
 
-def suggest_search_terms(topic_description, openai_api_key):
-    llm = ChatOpenAI(api_key=openai_api_key, model="gpt-4o")
+def suggest_search_terms(topic_description, openai_api_key=None, use_ollama=False):
+    if use_ollama:
+        llm = Ollama(model="llama3.1")
+    else:
+        llm = ChatOpenAI(api_key=openai_api_key, model="gpt-4o")
     prompt = ChatPromptTemplate.from_template("""
-    Given this research topic description, suggest 2-4 specific search terms that would be good for finding relevant papers on Semantic Scholar:
-    {topic}
+    Given this research topic description, suggest 2-4 specific search terms that would be good for finding relevant papers on Semantic Scholar. Use Semantic Scholar's advanced search operators to create precise queries:
+
+    Available operators:
+    - Use quotes for exact phrases: "machine learning"
+    - Use + to require terms: +ai +ethics
+    - Use - to exclude terms: -medicine
+    - Use | for OR: (ai | artificial intelligence)
+    - Use * for prefix matching: neural*
+    - Use ~N for fuzzy matching: algorithm~2
+    - Use "word1 word2" ~N for proximity search
+
+    Example good queries:
+    - ((cloud computing) | virtualization) +security -medicine
+    - "red blood cell" + artificial intelligence
+    - "machine learning" ~3 healthcare
+    - neuro* +cognition -psychology
+
+    Topic description: {topic}
     
-    Return only the search terms, one per line, nothing else.
+    Return only the search terms, one per line, nothing else. Make the queries specific and targeted using the operators above.
     """)
     
     messages = prompt.format_messages(topic=topic_description)
     response = llm.invoke(messages)
-    return [term.strip() for term in response.content.split('\n') if term.strip()]
+    
+    # Handle both string (Ollama) and Message object (OpenAI) responses
+    content = response if isinstance(response, str) else response.content
+    
+    # Clean up the response
+    content = content.replace('```', '').strip()
+    
+    # Return cleaned terms
+    return [term.strip() for term in content.split('\n') if term.strip()]
 
 # SemanticScholar API setup
-def collect_papers(queries, start_year=None, end_year=None, api_key=None):
+def collect_papers(queries, start_year=None, end_year=None, last_two_weeks=False, api_key=None, excluded_terms=None):
     url = "https://api.semanticscholar.org/graph/v1/paper/search/"
     params = {
         "fields": "title,url,abstract,citationCount,authors,publicationTypes,publicationDate,openAccessPdf",
         "limit": 100,
     }
     
-    # Add year range filter if provided
-    if start_year and end_year:
+    # Add date filtering
+    if last_two_weeks:
+        end_date = pd.Timestamp.now()
+        start_date = end_date - pd.Timedelta(days=14)
+        params["publicationDateOrYear"] = f"{start_date.strftime('%Y-%m-%d')}:{end_date.strftime('%Y-%m-%d')}"
+    elif start_year and end_year:
         params["year"] = f"{start_year}-{end_year}"
     elif start_year:
         params["year"] = f"{start_year}-"
@@ -133,7 +170,13 @@ def collect_papers(queries, start_year=None, end_year=None, api_key=None):
     results_by_term = {}  # Track results for each term
     
     for query in queries:
-        params["query"] = f'"{query}"'
+        # Don't wrap the query in quotes - let users specify their own syntax
+        if excluded_terms:
+            # Add excluded terms with proper syntax
+            excluded_query = ' '.join(f'-{term}' for term in excluded_terms)
+            query = f'{query} {excluded_query}'
+        
+        params["query"] = query
         with st.spinner(f"Searching for: {query}"):
             response = requests.get(url, params=params, headers=headers)
             papers = response.json().get('data', [])
@@ -190,12 +233,12 @@ def process_papers(papers):
     return df[existing_columns].copy()
 
 # Newsletter generation
-def generate_newsletter(papers_df, openai_api_key, custom_prompt=None):
+def generate_newsletter(papers_df, openai_api_key=None, custom_prompt=None, use_ollama=False, top_n_papers=35):
     # Sort by both date and citation count (giving more weight to recent papers)
     papers_df['score'] = papers_df['citationCount'].fillna(0) + (1 / (1 + (pd.Timestamp.now() - papers_df['publicationDate']).dt.days))
     
-    # Get top 35 papers based on score
-    papers_df = papers_df.sort_values('score', ascending=False).head(35)
+    # Get top N papers based on score
+    papers_df = papers_df.sort_values('score', ascending=False).head(top_n_papers)
     
     newsletter_prompt = ChatPromptTemplate.from_template(
         custom_prompt + "\n\nPapers to analyze:\n{topic_analyses}"
@@ -223,11 +266,15 @@ def generate_newsletter(papers_df, openai_api_key, custom_prompt=None):
     topic_analyses_text = "\n---\n".join(topic_analyses)
     
     # Generate newsletter
-    llm = ChatOpenAI(api_key=openai_api_key, model="gpt-4o")
+    if use_ollama:
+        llm = Ollama(model="llama3.1")
+    else:
+        llm = ChatOpenAI(api_key=openai_api_key, model="gpt-4o")
     messages = newsletter_prompt.format_messages(topic_analyses=topic_analyses_text)
     newsletter = llm.invoke(messages)
     
-    return newsletter.content
+    # Handle both Ollama (string) and OpenAI (Message object) responses
+    return newsletter if isinstance(newsletter, str) else newsletter.content
 
 
 def convert_to_docx(markdown_content):
@@ -342,112 +389,195 @@ with col2:
 # Sidebar for API keys
 with st.sidebar:
     st.header("API Configuration")
-    openai_api_key = st.text_input("OpenAI API Key", type="password")
+    use_ollama = st.checkbox("Use Ollama (local)", help="Use local Ollama instance instead of OpenAI (will only work on local machine with Ollama running)")
+    if use_ollama:
+        st.info("Using Ollama with llama3.1 model")
+    else:
+        st.session_state.openai_api_key = st.text_input("OpenAI API Key", type="password")
     semanticscholar_api_key = st.text_input("Semantic Scholar API Key (optional)", type="password")
     st.markdown("---")
     st.markdown("### About")
-    st.markdown("This tool uses Semantic Scholar's API and GPT-4o to generate research roundups from academic papers. Provide your OpenAI API key above to get started \n\n*(don't worry, your key stays secure on your device)* \n\nMade with ❤️ by [Ben Rochford](https://benrochford.com)")
+    st.markdown("This tool uses Semantic Scholar's API and LLMs to generate research roundups from academic papers. Launch Ollama or provide your OpenAI API key above to get started. \n\n*(don't worry, your key stays secure on your device)* \n\nMade with ❤️ by [Ben Rochford](https://benrochford.com)")
 
 # Main content
 tab1, tab2, tab3 = st.tabs(["Search Papers", "Browse Collected Papers", "Generate Roundup"])
 
 with tab1:
     st.header("Search papers with Semantic Scholar")
+    
+    # Date controls section
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        last_2_weeks = st.checkbox("Last 2 weeks", value=False)
+    
+    # Update dates based on last_2_weeks checkbox
+    if last_2_weeks:
+        start_date = datetime.now() - timedelta(days=14)
+        end_date = datetime.now()
+    else:
+        with col2:
+            start_date = st.date_input("Start Date (optional)", value=None)
+        with col3:
+            end_date = st.date_input("End Date (optional)", value=None)
+    
     search_method = st.radio("Search Method", ["Provide search terms", "Generate search terms automatically"])
     
-    # Replace date inputs with year selection
-    col1, col2 = st.columns(2)
-    current_year = pd.Timestamp.now().year
-    with col1:
-        start_year = st.number_input(
-            "Start Year",
-            min_value=1900,
-            max_value=current_year,
-            value=None,
-            placeholder="Optional",
-            help="(in or after this year)"
-        )
-    with col2:
-        end_year = st.number_input(
-            "End Year",
-            min_value=1900,
-            max_value=current_year,
-            value=None,
-            placeholder="Optional",
-            help="(in or before this year)"
-        )
+    # Initialize queries and selected_queries in session state if not exists
+    if 'generated_queries' not in st.session_state:
+        st.session_state.generated_queries = []
+    if 'selected_queries' not in st.session_state:
+        st.session_state.selected_queries = {}
     
-    if start_year and end_year and start_year > end_year:
-        st.error("Start year must be before or equal to end year")
-        
     # Initialize queries
     queries = []
     
     if search_method == "Provide search terms":
-        search_terms = st.text_area("Enter search terms (one per line)")
+        search_terms = st.text_area(
+            "Enter search terms (one per line)",
+            help="""Supports advanced search operators:
+            - Use quotes for exact phrases: "machine learning"
+            - Use + to require terms: +ai +ethics
+            - Use - to exclude terms: -privacy
+            - Use | for OR: (ai | artificial intelligence)
+            - Use * for prefix matching: neural*
+            - Use ~N for fuzzy matching: algorithm~2
+            - Use "word1 word2" ~N for proximity search
+            """
+        )
         queries = [term.strip() for term in search_terms.split('\n') if term.strip()]
     else:
         topic_description = st.text_area(
             "Describe your research topic",
-            placeholder="Example: society centered AI and developments in AI safety",
-            help="Provide a brief description of the research area you're interested in. Be specific about any particular aspects you want to focus on."
+            help="Describe the topic you want to research, and the LLM will generate a batch of terms",
+            placeholder="Example: Recent advances in quantum computing focusing on error correction"
         )
         
-        if not topic_description:
-            queries = []
-        else:
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                suggest_clicked = st.button(
-                    "🔍 Suggest Terms",
-                    disabled=not openai_api_key,
-                    help="Click to generate relevant search terms based on your description"
-                )
-            with col2:
-                if not openai_api_key:
-                    st.warning("⚠️ Please enter your OpenAI API key in the sidebar first")
-        
-            if suggest_clicked:
-                with st.spinner("Generating search terms..."):
-                    suggested_terms = suggest_search_terms(topic_description, openai_api_key)
-                    st.session_state.selected_terms = suggested_terms
-                    
-            if hasattr(st.session_state, 'selected_terms') and st.session_state.selected_terms:
-                st.subheader("Confirm auto search terms:")
-                current_selections = []
-                for term in st.session_state.selected_terms:
-                    if st.checkbox(term, value=True, key=f"term_{term}"):
-                        current_selections.append(term)
+        if topic_description:
+            if st.button("Generate Search Terms"):
+                if not (st.session_state.openai_api_key or use_ollama):
+                    st.warning("⚠️ Please configure LLM in the sidebar first")
+                else:
+                    with st.spinner("Generating search terms..."):
+                        generated_terms = suggest_search_terms(
+                            topic_description, 
+                            st.session_state.openai_api_key,
+                            use_ollama
+                        )
+                        st.session_state.generated_queries = [
+                            term.strip().lstrip("0123456789.- ")
+                            for term in generated_terms
+                            if term.strip()
+                        ]
+                        # Initialize all new terms as selected
+                        for query in st.session_state.generated_queries:
+                            if query not in st.session_state.selected_queries:
+                                st.session_state.selected_queries[query] = True
                 
-                custom_terms = st.text_area(
-                    "Add additional search terms (optional, one per line)",
-                    placeholder="Enter additional terms, one per line"
-                )
-                if custom_terms:
-                    for term in custom_terms.split('\n'):
-                        term = term.strip()
-                        if term and term not in current_selections:
-                            current_selections.append(term)
+                st.write("Generated search terms:")
+                for i, query in enumerate(st.session_state.generated_queries):
+                    col1, col2 = st.columns([1, 20])
+                    with col1:
+                        st.session_state.selected_queries[query] = st.checkbox(
+                            "Use",
+                            value=st.session_state.selected_queries.get(query, True),
+                            key=f"search_term_checkbox_{i}",
+                            label_visibility="collapsed"
+                        )
+                    with col2:
+                        st.code(query)
                 
-                queries = current_selections
+                # Use only the selected generated queries for the search
+                queries = [q for q in st.session_state.generated_queries 
+                          if st.session_state.selected_queries.get(q, True)]
+            else:
+                # Show previously generated queries with their checkboxes if they exist
+                if st.session_state.generated_queries:
+                    st.write("Generated search terms:")
+                    for i, query in enumerate(st.session_state.generated_queries):
+                        col1, col2 = st.columns([1, 20])
+                        with col1:
+                            st.session_state.selected_queries[query] = st.checkbox(
+                                "Use",
+                                value=st.session_state.selected_queries.get(query, True),
+                                key=f"search_term_checkbox_{i}",
+                                label_visibility="collapsed"
+                            )
+                        with col2:
+                            st.code(query)
+                
+                    # Use only the selected generated queries for the search
+                    queries = [q for q in st.session_state.generated_queries 
+                              if st.session_state.selected_queries.get(q, True)]
     
-    # Update search button section to use years instead of dates
-    if queries and (not (start_year and end_year) or start_year <= end_year):
+    # Update excluded terms input and processing
+    excluded_terms_input = st.text_area(
+        "Excluded terms (one per line)",
+        help="""Each term will be automatically prefixed with - to exclude it.
+        For exact phrases, use quotes: "machine learning"
+        """,
+        placeholder="Enter terms to exclude, one per line"
+    )
+    # Process excluded terms as complete lines, not individual characters
+    excluded_terms = [line.strip() for line in excluded_terms_input.split('\n') if line.strip()]
+
+    # Preview API call
+    if queries:
+        st.write("---")
+        st.write("Preview of API calls to be made:")
+        base_url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        params = {
+            "fields": "title,url,abstract,citationCount,authors,publicationTypes,publicationDate,openAccessPdf",
+            "limit": 100
+        }
+        
+        # Add date parameters if applicable
+        if last_2_weeks:
+            end_date = pd.Timestamp.now()
+            start_date = end_date - pd.Timedelta(days=14)
+            params["publicationDateOrYear"] = f"{start_date.strftime('%Y-%m-%d')}:{end_date.strftime('%Y-%m-%d')}"
+        elif start_date and end_date:  # Only add year parameter if both dates are provided
+            params["year"] = f"{start_date.year}-{end_date.year}"
+        elif start_date:  # Only start date provided
+            params["year"] = f"{start_date.year}-"
+        elif end_date:  # Only end date provided
+            params["year"] = f"-{end_date.year}"
+        
+        # Show URL for first query as example
+        example_query = queries[0]
+        if excluded_terms:
+            excluded_query = ' '.join(f'-{term}' for term in excluded_terms)
+            example_query = f'{example_query} {excluded_query}'
+        
+        params["query"] = example_query
+        preview_url = f"{base_url}?{'&'.join(f'{k}={requests.utils.quote(str(v))}' for k, v in params.items())}"
+        st.code(preview_url, language="text")
+        if len(queries) > 1:
+            st.caption(f"(+ {len(queries)-1} more queries)")
+    
+    # Update search button section
+    if queries:
         st.write("---")
         col1, col2 = st.columns([1, 3])
         with col1:
             search_clicked = st.button(
                 "🚀 Search Semantic Scholar",
-                disabled=not openai_api_key,
+                disabled=not (st.session_state.openai_api_key or use_ollama),
                 help="Click to search for papers on Semantic Scholar using the selected terms"
             )
         with col2:
-            if not openai_api_key:
+            if not (st.session_state.openai_api_key or use_ollama):
                 st.warning("⚠️ Please enter your OpenAI API key in the sidebar first")
         
         if search_clicked:
             with st.spinner("Initializing search..."):
-                papers, results_by_term = collect_papers(queries, start_year, end_year, semanticscholar_api_key)
+                papers, results_by_term = collect_papers(
+                    queries,
+                    start_date.year if start_date else None,
+                    end_date.year if end_date else None,
+                    last_two_weeks=last_2_weeks,
+                    api_key=semanticscholar_api_key,
+                    excluded_terms=excluded_terms
+                )
                 st.session_state.papers_df = process_papers(papers)
                 
                 # Success message with tab navigation instruction
@@ -473,15 +603,26 @@ with tab3:
     if st.session_state.papers_df is not None:
         st.header("Generate Roundup")
 
-        # Compute and display top 35 papers with relevancy scores
+        # Use columns to make the number input narrower
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            st.session_state.top_n_papers = st.number_input(
+                "Number of papers to include in roundup",
+                min_value=5,
+                max_value=100,
+                value=st.session_state.top_n_papers,
+                help="Select how many of the most relevant papers to include in the roundup"
+            )
+
+        # Compute and display top N papers with relevancy scores
         st.session_state.papers_df['score'] = st.session_state.papers_df['citationCount'].fillna(0) + \
             100*(1 / (1 + (pd.Timestamp.now() - st.session_state.papers_df['publicationDate']).dt.days))
         
-        top_papers_df = st.session_state.papers_df.sort_values('score', ascending=False).head(35)
+        top_papers_df = st.session_state.papers_df.sort_values('score', ascending=False).head(st.session_state.top_n_papers)
         top_papers_df = top_papers_df[['score'] + [col for col in top_papers_df.columns if col != 'score']]
         
         with st.expander("📄 Papers Selected for Roundup", expanded=False):
-            st.write("The top 35 most relevant papers selected for the roundup, based on recency and citation count")
+            st.write(f"The top {st.session_state.top_n_papers} most relevant papers selected for the roundup, based on recency and citation count")
             st.dataframe(top_papers_df)
         
         # Add prompt customization with expander
@@ -506,7 +647,7 @@ with tab3:
             if custom_prompt != st.session_state.custom_prompt:
                 st.session_state.custom_prompt = custom_prompt
         
-        if st.button("Generate Research Roundup") and openai_api_key:
+        if st.button("Generate Research Roundup") and (st.session_state.openai_api_key or use_ollama):
             progress_placeholder = st.empty()
             message_placeholder = st.empty()
             
@@ -528,8 +669,10 @@ with tab3:
                         if message_index == 0:
                             newsletter_content = generate_newsletter(
                                 st.session_state.papers_df,
-                                openai_api_key,
-                                st.session_state.custom_prompt
+                                st.session_state.openai_api_key,
+                                st.session_state.custom_prompt,
+                                use_ollama,
+                                st.session_state.top_n_papers
                             )
                         
                         message_index += 1
