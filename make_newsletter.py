@@ -9,6 +9,8 @@ import markdown
 import time
 from langchain_community.llms import Ollama
 from datetime import datetime, timedelta
+import json
+import re
 
 DEFAULT_ROUNDUP_PROMPT = """Create a research round-up following this structure:
 
@@ -376,6 +378,40 @@ def process_links(text):
     
     return text.strip()
 
+def score_paper_relevance(paper_row, criteria, llm):
+    # Get abstract safely
+    abstract = paper_row.get('abstract', '') if isinstance(paper_row, dict) else paper_row['abstract']
+    if pd.isna(abstract):
+        abstract = "No abstract available"
+    
+    # Get title safely
+    title = paper_row.get('title', '') if isinstance(paper_row, dict) else paper_row['title']
+    
+    prompt = f"""Rate how relevant this paper is to the given research criteria. Respond with ONLY a number 1-4 where:
+1 = Not relevant
+2 = Only a little relevant
+3 = Somewhat relevant
+4 = Very relevant
+
+Research criteria: {criteria}
+
+Paper Title: {title}
+Abstract: {abstract}
+
+Return only the number 1-4, nothing else."""
+    
+    response = llm.invoke(prompt)
+    content = response if isinstance(response, str) else response.content
+    
+    try:
+        # Extract first number found in the response
+        match = re.search(r'[1-4]', content)
+        if match:
+            score = int(match.group())
+            return max(1, min(4, score))  # Ensure score is between 1-4
+        return 1
+    except:
+        return 1
 
 ## UI Layout ##
 
@@ -400,7 +436,7 @@ with st.sidebar:
     st.markdown("This tool uses Semantic Scholar's API and LLMs to generate research roundups from academic papers. Launch Ollama or provide your OpenAI API key above to get started. \n\n*(don't worry, your key stays secure on your device)* \n\nMade with ❤️ by [Ben Rochford](https://benrochford.com)")
 
 # Main content
-tab1, tab2, tab3 = st.tabs(["Search Papers", "Browse Collected Papers", "Generate Roundup"])
+tab1, tab2, tab3 = st.tabs(["Search Papers", "Browse and FilterCollected Papers", "Generate Roundup"])
 
 with tab1:
     st.header("Search papers with Semantic Scholar")
@@ -444,6 +480,8 @@ with tab1:
             - Use "word1 word2" ~N for proximity search
             """
         )
+        # Store search terms as topic description
+        st.session_state.topic_description = search_terms.replace('\n', ', ')
         queries = [term.strip() for term in search_terms.split('\n') if term.strip()]
     else:
         topic_description = st.text_area(
@@ -451,6 +489,9 @@ with tab1:
             help="Describe the topic you want to research, and the LLM will generate a batch of terms",
             placeholder="Example: Recent advances in quantum computing focusing on error correction"
         )
+        # Store topic description
+        if topic_description:
+            st.session_state.topic_description = topic_description
         
         if topic_description:
             if st.button("Generate Search Terms"):
@@ -596,12 +637,131 @@ with tab2:
             },
             hide_index=True,
         )
+
+        if st.session_state.papers_df is not None:
+            st.markdown("---")
+            enable_filtering = st.checkbox("Do LLM relevance filtering?")
+            
+            if enable_filtering:
+                with st.expander("Relevance Filtering Options", expanded=True):
+                    # Get the topic description from session state if it exists
+                    default_criteria = ""
+                    if hasattr(st.session_state, 'topic_description'):
+                        default_criteria = st.session_state.topic_description
+                    
+                    criteria = st.text_area(
+                        "Inclusion criteria / topic",
+                        value=default_criteria,
+                        help="Describe what makes a paper relevant to your research"
+                    )
+                    
+                    include_all = st.checkbox("Include all papers", value=True)
+                    max_papers = len(st.session_state.papers_df)
+                    
+                    if not include_all:
+                        papers_to_check = st.number_input(
+                            "Include top N papers by citation and recency score",
+                            min_value=1,
+                            max_value=max_papers,
+                            value=min(20, max_papers)
+                        )
+                    else:
+                        papers_to_check = max_papers
+                    
+                    if st.button("Filter papers"):
+                        if not (st.session_state.openai_api_key or use_ollama):
+                            st.error("Please configure LLM in sidebar first")
+                        else:
+                            # Sort papers by score and take top N
+                            sorted_papers = st.session_state.papers_df.sort_values('score', ascending=False).head(papers_to_check)
+                            
+                            # Initialize LLM
+                            if use_ollama:
+                                llm = Ollama(model="llama3.1")
+                            else:
+                                llm = ChatOpenAI(api_key=st.session_state.openai_api_key, model="gpt-4o")
+                            
+                            # Score papers
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            scores = []
+                            for idx, paper in sorted_papers.iterrows():
+                                status_text.text(f"Scoring paper {len(scores)+1} of {len(sorted_papers)}")
+                                score = score_paper_relevance(paper, criteria, llm)
+                                scores.append(score)
+                                progress_bar.progress((len(scores)) / len(sorted_papers))
+                            
+                            # Add scores to dataframe
+                            sorted_papers['relevance_score'] = scores
+                            st.session_state.scored_papers = sorted_papers
+                            
+                            progress_bar.empty()
+                            status_text.empty()
+                            
+                            st.success("Scoring complete!")
+                    
+                    if 'scored_papers' in st.session_state:
+                        min_score = st.selectbox(
+                            "Include only papers with this relevance score or higher:",
+                            options=[
+                                "1 - Not relevant",
+                                "2 - Only a little relevant", 
+                                "3 - Somewhat relevant",
+                                "4 - Very relevant"
+                            ],
+                            index=2  # Default to "3 - Somewhat relevant"
+                        )
+                        
+                        # Extract numeric score from selection
+                        min_score = int(min_score.split(" - ")[0])
+                        
+                        filtered_papers = st.session_state.scored_papers[
+                            st.session_state.scored_papers['relevance_score'] >= min_score
+                        ]
+                        
+                        st.write(f"Showing {len(filtered_papers)} papers meeting relevance criteria:")
+                        
+                        # Reorder columns to put relevance_score first
+                        display_columns = ['relevance_score'] + [col for col in filtered_papers.columns if col != 'relevance_score']
+                        filtered_papers = filtered_papers[display_columns]
+                        
+                        st.dataframe(
+                            filtered_papers,
+                            column_config={
+                                "title": st.column_config.TextColumn("Title", width="large"),
+                                "url": st.column_config.LinkColumn("URL"),
+                                "abstract": st.column_config.TextColumn("Abstract", width="large"),
+                                "relevance_score": st.column_config.NumberColumn(
+                                    "Relevance",
+                                    help="1=Not relevant, 2=Only a little relevant, 3=Somewhat relevant, 4=Very relevant"
+                                )
+                            },
+                            hide_index=True
+                        )
+                        
+                        # Store filtered papers for use in roundup generation
+                        st.session_state.filtered_papers = filtered_papers
     else:
         st.info("No papers collected yet. Use the Search tab to find papers.")
 
 with tab3:
     if st.session_state.papers_df is not None:
         st.header("Generate Roundup")
+
+        # Add option to use filtered papers if available
+        use_filtered = False
+        if hasattr(st.session_state, 'filtered_papers'):
+            use_filtered = st.checkbox(
+                "Use only relevant-scored papers",
+                value=True,
+                help="Use only papers that met the relevance criteria from filtering"
+            )
+        
+        papers_for_roundup = st.session_state.filtered_papers if use_filtered else st.session_state.papers_df
+
+        # Calculate max available papers
+        max_available_papers = len(papers_for_roundup)
 
         # Use columns to make the number input narrower
         col1, col2 = st.columns([1, 3])
@@ -610,15 +770,19 @@ with tab3:
                 "Number of papers to include in roundup",
                 min_value=5,
                 max_value=100,
-                value=st.session_state.top_n_papers,
+                value=min(st.session_state.top_n_papers, max_available_papers),  # Ensure value doesn't exceed available papers
                 help="Select how many of the most relevant papers to include in the roundup"
             )
 
+        if st.session_state.top_n_papers > max_available_papers:
+            st.session_state.top_n_papers = max_available_papers
+            st.info(f"Adjusted number of papers to {max_available_papers} to match available papers")
+
         # Compute and display top N papers with relevancy scores
-        st.session_state.papers_df['score'] = st.session_state.papers_df['citationCount'].fillna(0) + \
-            100*(1 / (1 + (pd.Timestamp.now() - st.session_state.papers_df['publicationDate']).dt.days))
+        papers_for_roundup['score'] = papers_for_roundup['citationCount'].fillna(0) + \
+            100*(1 / (1 + (pd.Timestamp.now() - papers_for_roundup['publicationDate']).dt.days))
         
-        top_papers_df = st.session_state.papers_df.sort_values('score', ascending=False).head(st.session_state.top_n_papers)
+        top_papers_df = papers_for_roundup.sort_values('score', ascending=False).head(st.session_state.top_n_papers)
         top_papers_df = top_papers_df[['score'] + [col for col in top_papers_df.columns if col != 'score']]
         
         with st.expander("📄 Papers Selected for Roundup", expanded=False):
@@ -668,7 +832,7 @@ with tab3:
                         # Generate newsletter on first iteration
                         if message_index == 0:
                             newsletter_content = generate_newsletter(
-                                st.session_state.papers_df,
+                                papers_for_roundup,
                                 st.session_state.openai_api_key,
                                 st.session_state.custom_prompt,
                                 use_ollama,
@@ -682,6 +846,7 @@ with tab3:
             
             # Clear the loading message
             message_placeholder.empty()
+            
         if st.session_state.newsletter_content:
             st.markdown("---")
             st.markdown(st.session_state.newsletter_content)
